@@ -320,10 +320,23 @@ local function drawCardFace(card, x, y, w, h, r)
             love.graphics.pop()
         end
     else
-        -- Face cards (J, Q, K): just show rank in center
+        -- Face cards (J, Q, K): center rank and suit together
         local faceRank = card.rank
-        love.graphics.printf(faceRank, cx - 20, cy - 10, 40, "center")
-        drawSuitSymbol(card.suit, cx, cy + 15, 18)
+        local font = love.graphics.getFont()
+        local rankWidth = font:getWidth(faceRank)
+        local rankHeight = font:getHeight()
+        local suitSize = 18
+        local spacing = 2  -- Space between rank and suit
+
+        -- Total width of rank + suit combination
+        local totalWidth = rankWidth + spacing + suitSize
+        local startX = cx - totalWidth / 2
+
+        -- Draw rank
+        love.graphics.print(faceRank, startX, cy - rankHeight / 2)
+
+        -- Draw suit symbol next to rank, vertically centered
+        drawSuitSymbol(card.suit, startX + rankWidth + spacing + suitSize / 2, cy, suitSize)
     end
 end
 

@@ -308,12 +308,88 @@ function KlondikeGame:updateDropHighlights()
     end
 end
 
+-- Calculate rectangle overlap area
+local function getOverlapArea(x1, y1, w1, h1, x2, y2, w2, h2)
+    local overlapX = math.max(0, math.min(x1 + w1, x2 + w2) - math.max(x1, x2))
+    local overlapY = math.max(0, math.min(y1 + h1, y2 + h2) - math.max(y1, y2))
+    return overlapX * overlapY
+end
+
+-- Calculate distance between rectangle centers
+local function getCenterDistance(x1, y1, w1, h1, x2, y2, w2, h2)
+    local cx1, cy1 = x1 + w1 / 2, y1 + h1 / 2
+    local cx2, cy2 = x2 + w2 / 2, y2 + h2 / 2
+    return math.sqrt((cx1 - cx2)^2 + (cy1 - cy2)^2)
+end
+
+-- Find best drop target based on card overlap
+function KlondikeGame:findBestDropTarget()
+    if not self.dragging or #self.dragCards == 0 then
+        return nil, nil
+    end
+
+    -- Calculate dragged cards bounds
+    local dragX = self.dragX - self.dragOffsetX
+    local dragY = self.dragY - self.dragOffsetY
+    local dragW = Card.WIDTH
+    local dragH = Card.HEIGHT + (#self.dragCards - 1) * Tableau.FACE_UP_SPREAD
+
+    local bestPile = nil
+    local bestPileType = nil
+    local bestOverlap = 0
+    local bestDistance = math.huge
+
+    -- Check tableaus
+    for i, tableau in ipairs(self.tableaus) do
+        if tableau ~= self.dragSource and tableau:canAccept(self.dragCards) then
+            local px, py, pw, ph = tableau:getBounds()
+            local overlap = getOverlapArea(dragX, dragY, dragW, dragH, px, py, pw, ph)
+
+            if overlap > 0 then
+                local dist = getCenterDistance(dragX, dragY, dragW, dragH, px, py, pw, ph)
+                -- Prefer larger overlap, then closer distance
+                if overlap > bestOverlap or (overlap == bestOverlap and dist < bestDistance) then
+                    bestPile = tableau
+                    bestPileType = "tableau"
+                    bestOverlap = overlap
+                    bestDistance = dist
+                end
+            end
+        end
+    end
+
+    -- Check foundations (only for single cards)
+    if #self.dragCards == 1 then
+        for i, foundation in ipairs(self.foundations) do
+            if foundation:canAccept(self.dragCards) then
+                local px, py = foundation.x, foundation.y
+                local pw, ph = Card.WIDTH, Card.HEIGHT
+                local overlap = getOverlapArea(dragX, dragY, dragW, dragH, px, py, pw, ph)
+
+                if overlap > 0 then
+                    local dist = getCenterDistance(dragX, dragY, dragW, dragH, px, py, pw, ph)
+                    if overlap > bestOverlap or (overlap == bestOverlap and dist < bestDistance) then
+                        bestPile = foundation
+                        bestPileType = "foundation"
+                        bestOverlap = overlap
+                        bestDistance = dist
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPile, bestPileType
+end
+
 -- End drag (drop cards)
 function KlondikeGame:endDrag(x, y)
     if not self.dragging then return end
 
     local dropped = false
-    local pile, pileType = self:findPileAt(x, y)
+
+    -- Find best drop target based on card overlap
+    local pile, pileType = self:findBestDropTarget()
 
     if pile and pile ~= self.dragSource then
         if pile:canAccept(self.dragCards) then

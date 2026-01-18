@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git fetch:*)",
+      "Bash(timeout:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nImplement Klondike Solitaire game\n\nAdd a complete Klondike Solitaire implementation as the foundation for the\nBridge card game suite. Features include:\n\n- Procedurally rendered cards with suits and rank symbols\n- Full Klondike rules \\(alternating colors, descending ranks\\)\n- Drag and drop card movement with valid move highlighting\n- Double-click to auto-move cards to foundations\n- Draw 1 or Draw 3 modes \\(toggleable via settings\\)\n- Score tracking based on classic Windows Solitaire scoring\n- Timer and move counter in HUD\n- Win detection with celebration screen\n- Resolution-independent scaling via LoveLibs\n\nGame architecture designed for reusability - card system in src/cards/\ncan be extended for future games in the suite.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
