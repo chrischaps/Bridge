@@ -3,27 +3,21 @@
 -- Only the top card can be moved to tableau or foundation
 
 local Pile = require("src.cards.pile")
-local Card = require("src.cards.card")
 
 local Waste = setmetatable({}, {__index = Pile})
 Waste.__index = Waste
 
 -- Spread for showing multiple drawn cards (draw 3 mode)
-Waste.SPREAD_X = 20
+Waste.SPREAD_X = 22
 
 -- Create a new waste pile
 function Waste.new(x, y)
-    local self = setmetatable(Pile.new(x, y), Waste)
-    self.spreadX = 0
-    self.spreadY = 0
-    self.visibleCount = 1  -- How many cards are visible (1 or 3)
+    local self = setmetatable(Pile.new(x, y, "waste"), Waste)
+    -- How many of the top cards are fanned out. Set by each draw and
+    -- shrinks as fanned cards are played, so buried cards never slide
+    -- into the fan (classic Draw 3 behaviour).
+    self.fanCount = 0
     return self
-end
-
--- Set how many cards are visible (for draw 1 vs draw 3)
-function Waste:setVisibleCount(count)
-    self.visibleCount = count
-    self:updateCardPositions()
 end
 
 -- Waste doesn't accept cards from drag/drop
@@ -36,104 +30,63 @@ function Waste:canPickUp(index)
     return index == #self.cards and #self.cards > 0
 end
 
--- Add cards from stock
+-- Add cards drawn from stock
 function Waste:addFromStock(cards)
     for _, card in ipairs(cards) do
         card:setFaceUp(true, false)
         table.insert(self.cards, card)
     end
+    self.fanCount = #cards
     self:updateCardPositions()
 end
 
--- Get all cards (for resetting stock)
-function Waste:getAllCards()
-    local cards = {}
-    for _, card in ipairs(self.cards) do
-        table.insert(cards, card)
-    end
-    return cards
+-- The top card was taken: the fan shrinks by one
+function Waste:onTopTaken()
+    self.fanCount = math.max(0, self.fanCount - 1)
+    self:updateCardPositions()
 end
 
--- Update card positions with spread for visible cards
-function Waste:updateCardPositions(immediate)
-    local visibleStart = math.max(1, #self.cards - self.visibleCount + 1)
-
-    for i, card in ipairs(self.cards) do
-        local targetX = self.x
-        local targetY = self.y
-        card.zIndex = i
-
-        -- Spread visible cards
-        if i >= visibleStart then
-            local visibleIndex = i - visibleStart
-            targetX = self.x + visibleIndex * Waste.SPREAD_X
-        end
-
-        card:moveTo(targetX, targetY, immediate)
-    end
+-- Index of the first fanned card
+function Waste:fanStart()
+    local fan = math.max(1, math.min(self.fanCount, #self.cards))
+    return #self.cards - fan + 1
 end
 
--- Draw the waste pile
-function Waste:draw(excludeFromIndex)
-    -- Draw placeholder when empty
-    if #self.cards == 0 then
-        love.graphics.setColor(0.2, 0.35, 0.2, 0.3)
-        love.graphics.setLineWidth(1)
-        love.graphics.rectangle("line", self.x, self.y, Card.WIDTH, Card.HEIGHT, Card.CORNER_RADIUS)
-
-        if self.highlighted then
-            love.graphics.setColor(self.highlightColor)
-            love.graphics.rectangle("fill", self.x, self.y, Card.WIDTH, Card.HEIGHT, Card.CORNER_RADIUS)
-        end
-        return
+function Waste:cardPosition(i)
+    local start = self:fanStart()
+    if i >= start then
+        return self.x + (i - start) * Waste.SPREAD_X, self.y
     end
-
-    -- Draw highlight if highlighted
-    if self.highlighted then
-        local width = Card.WIDTH + (self.visibleCount - 1) * Waste.SPREAD_X
-        love.graphics.setColor(self.highlightColor)
-        love.graphics.rectangle("fill", self.x - 2, self.y - 2,
-            width + 4, Card.HEIGHT + 4, Card.CORNER_RADIUS + 2)
-    end
-
-    -- Only draw visible cards (or up to excludeFromIndex)
-    local visibleStart = math.max(1, #self.cards - self.visibleCount + 1)
-    local endIndex = excludeFromIndex and (excludeFromIndex - 1) or #self.cards
-
-    for i = visibleStart, endIndex do
-        local card = self.cards[i]
-        card:draw()
-    end
-
-    love.graphics.setColor(1, 1, 1)
+    return self.x, self.y
 end
 
--- Override containsPoint for spread cards
-function Waste:containsPoint(px, py)
-    if #self.cards == 0 then
-        return px >= self.x and px <= self.x + Card.WIDTH and
-               py >= self.y and py <= self.y + Card.HEIGHT
-    end
-
-    -- Check the spread area
-    local width = Card.WIDTH + (math.min(#self.cards, self.visibleCount) - 1) * Waste.SPREAD_X
-    return px >= self.x and px <= self.x + width and
-           py >= self.y and py <= self.y + Card.HEIGHT
-end
-
--- Find card at point (for drag detection)
+-- Only the top card can be selected
 function Waste:findCardAtPoint(px, py)
     if #self.cards == 0 then
         return nil, nil
     end
-
-    -- Only the top card can be selected
-    local topCard = self.cards[#self.cards]
-    if topCard:containsPoint(px, py) then
-        return #self.cards, topCard
+    local Card = require("src.cards.card")
+    local cx, cy = self:cardPosition(#self.cards)
+    if px >= cx and px <= cx + Card.WIDTH and py >= cy and py <= cy + Card.HEIGHT then
+        return #self.cards, self.cards[#self.cards]
     end
-
     return nil, nil
+end
+
+-- Draw the waste: only the card under the fan and the fan itself show
+function Waste:draw()
+    if #self.cards == 0 then return end
+    local first = self:fanStart()
+    -- the card beneath the fan peeks out while the fan's base card is lifted away
+    local base = first
+    while base > 1 and not Pile.isResting(self.cards[base]) do
+        base = base - 1
+    end
+    if base < first and Pile.isResting(self.cards[base]) then
+        self.cards[base]:draw()
+    end
+    self:drawCards(first)
+    love.graphics.setColor(1, 1, 1)
 end
 
 return Waste

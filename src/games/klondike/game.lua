@@ -1,8 +1,11 @@
 -- Klondike Solitaire Game Controller
--- Manages all game state, input handling, and win condition checking
+-- Owns the piles and the rules. Every change to the cards goes through one
+-- pipeline (canMove/applyMove, drawStock, undo), which keeps scoring, flips,
+-- undo history and win detection in one place.
 
 local Card = require("src.cards.card")
 local Deck = require("src.cards.deck")
+local Pile = require("src.cards.pile")
 local Tableau = require("src.games.klondike.tableau")
 local Foundation = require("src.games.klondike.foundation")
 local Stock = require("src.games.klondike.stock")
@@ -12,14 +15,20 @@ local Scoring = require("src.games.klondike.scoring")
 local KlondikeGame = {}
 KlondikeGame.__index = KlondikeGame
 
--- Layout constants
+-- Layout constants (virtual pixels)
 KlondikeGame.LAYOUT = {
-    MARGIN_TOP = 30,
-    MARGIN_LEFT = 40,
-    CARD_GAP = 15,
-    TABLEAU_TOP = 150,
-    FOUNDATION_OFFSET = 3,  -- Gap between waste and foundations
+    MARGIN_TOP = 22,
+    CARD_GAP = 18,
+    ROW_GAP = 26,        -- between the top row and the tableau
+    BOTTOM_RESERVE = 54, -- room kept free for the rail at the bottom
 }
+
+-- Pointer travel (virtual px) before a press becomes a drag
+KlondikeGame.DRAG_THRESHOLD = 4
+-- Seconds between cards when auto-completing
+KlondikeGame.AUTO_STEP = 0.08
+-- Deal animation: seconds between cards
+KlondikeGame.DEAL_STAGGER = 0.035
 
 -- Create a new Klondike game
 function KlondikeGame.new(screenWidth, screenHeight)
@@ -27,588 +36,711 @@ function KlondikeGame.new(screenWidth, screenHeight)
 
     self.screenWidth = screenWidth or 960
     self.screenHeight = screenHeight or 540
-
-    -- Game settings
-    self.drawCount = 1  -- 1 or 3 cards from stock
-
-    -- Game state
+    self.drawCount = 1
     self.state = "playing"  -- playing, won
     self.scoring = Scoring.new()
+    self.listener = nil      -- function(event, data) for sound and effects
 
-    -- Piles
-    self.stock = nil
-    self.waste = nil
-    self.foundations = {}
-    self.tableaus = {}
+    self.cards = {}
+    self.history = {}
+    self.flyLayer = {}
 
-    -- Drag state
-    self.dragging = false
-    self.dragCards = {}
-    self.dragSource = nil
-    self.dragSourceIndex = nil
-    self.dragOffsetX = 0
-    self.dragOffsetY = 0
-    self.dragX = 0
-    self.dragY = 0
+    self.press = nil         -- pointer pressed on a card, not yet a drag
+    self.drag = nil          -- active drag
+    self.hint = nil          -- {move=..., time=...}
+    self.autoCompleting = false
+    self.dealing = 0         -- seconds of deal animation left
+    self.mouseX, self.mouseY = -1000, -1000
 
-    -- Double-click detection
-    self.lastClickTime = 0
-    self.lastClickCard = nil
-    self.doubleClickThreshold = 0.3
-
-    -- Win animation state
-    self.winParticles = {}
-
+    self:createPiles()
     return self
 end
 
--- Initialize/reset the game
-function KlondikeGame:init(drawCount)
+--------------------------------------------------
+-- SETUP
+--------------------------------------------------
+
+function KlondikeGame:createPiles()
+    self.stock = Stock.new(0, 0)
+    self.waste = Waste.new(0, 0)
+    self.foundations, self.tableaus = {}, {}
+    for i = 1, 4 do self.foundations[i] = Foundation.new(0, 0, i) end
+    for i = 1, 7 do self.tableaus[i] = Tableau.new(0, 0, i) end
+
+    self.piles = {self.stock, self.waste}
+    for _, f in ipairs(self.foundations) do self.piles[#self.piles + 1] = f end
+    for _, t in ipairs(self.tableaus) do self.piles[#self.piles + 1] = t end
+
+    -- Destinations in preference order: foundations, then tableaus
+    self.targets = {}
+    for _, f in ipairs(self.foundations) do self.targets[#self.targets + 1] = f end
+    for _, t in ipairs(self.tableaus) do self.targets[#self.targets + 1] = t end
+
+    self:layout()
+end
+
+-- Position the piles for the current card size and screen
+function KlondikeGame:layout()
+    local L = KlondikeGame.LAYOUT
+    local w, gap = Card.WIDTH, L.CARD_GAP
+    local rowWidth = 7 * w + 6 * gap
+    local left = math.floor((self.screenWidth - rowWidth) / 2)
+    local col = function(i) return left + (i - 1) * (w + gap) end
+
+    local topY = L.MARGIN_TOP
+    self.stock.x, self.stock.y = col(1), topY
+    self.waste.x, self.waste.y = col(2), topY
+    for i, f in ipairs(self.foundations) do
+        f.x, f.y = col(i + 3), topY
+    end
+    local tableauY = topY + Card.HEIGHT + L.ROW_GAP
+    for i, t in ipairs(self.tableaus) do
+        t.x, t.y = col(i), tableauY
+        t.maxBottom = self.screenHeight - L.BOTTOM_RESERVE
+    end
+    for _, p in ipairs(self.piles) do
+        p:updateCardPositions(true)
+    end
+end
+
+-- Deal a new game. seed picks the shuffle (a "deal number"); animate flies
+-- the cards out of the stock.
+function KlondikeGame:deal(drawCount, seed, animate)
     self.drawCount = drawCount or self.drawCount
+    self.seed = seed or love.math.random(1, 99999)
     self.state = "playing"
-
-    -- Calculate layout
-    local layout = KlondikeGame.LAYOUT
-    local cardW = Card.WIDTH
-    local cardH = Card.HEIGHT
-    local gap = layout.CARD_GAP
-
-    -- Top row: Stock, Waste, [gap], 4 Foundations
-    local topY = layout.MARGIN_TOP
-
-    -- Stock position
-    local stockX = layout.MARGIN_LEFT
-    self.stock = Stock.new(stockX, topY)
-
-    -- Waste position (next to stock)
-    local wasteX = stockX + cardW + gap
-    self.waste = Waste.new(wasteX, topY)
-    self.waste:setVisibleCount(self.drawCount)
-
-    -- Foundation positions (right side)
-    self.foundations = {}
-    local foundationStartX = self.screenWidth - layout.MARGIN_LEFT - (4 * cardW + 3 * gap)
-    for i = 1, 4 do
-        local fx = foundationStartX + (i - 1) * (cardW + gap)
-        local foundation = Foundation.new(fx, topY)
-        table.insert(self.foundations, foundation)
-    end
-
-    -- Tableau piles (7 columns)
-    self.tableaus = {}
-    local tableauY = layout.TABLEAU_TOP
-    local totalTableauWidth = 7 * cardW + 6 * gap
-    local tableauStartX = (self.screenWidth - totalTableauWidth) / 2
-
-    for i = 1, 7 do
-        local tx = tableauStartX + (i - 1) * (cardW + gap)
-        local tableau = Tableau.new(tx, tableauY)
-        table.insert(self.tableaus, tableau)
-    end
-
-    -- Create and shuffle deck
-    local deck = Deck.new()
-    deck:create()
-    deck:shuffle()
-
-    -- Deal to tableaus (1 card to first pile, 2 to second, etc.)
-    for i = 1, 7 do
-        for j = i, 7 do
-            local card = deck:deal()
-            if card then
-                -- Only the top card of each pile is face up
-                card:setFaceUp(j == i, true)
-                self.tableaus[j]:addCard(card, true)
-            end
-        end
-    end
-
-    -- Remaining cards go to stock
-    while not deck:isEmpty() do
-        local card = deck:deal()
-        card:setFaceUp(false, true)
-        self.stock:addCard(card, true)
-    end
-
-    -- Reset scoring
+    self.history = {}
+    self.flyLayer = {}
+    self.press, self.drag, self.hint = nil, nil, nil
+    self.autoCompleting = false
     self.scoring:start(self.drawCount)
 
-    -- Reset drag state
-    self:cancelDrag()
-end
+    for _, p in ipairs(self.piles) do p:clear() end
+    self.waste.fanCount = 0
 
--- Set draw count (1 or 3)
-function KlondikeGame:setDrawCount(count)
-    self.drawCount = count
-    if self.waste then
-        self.waste:setVisibleCount(count)
-    end
-end
+    local deck = Deck.new():create()
+    deck:shuffle(love.math.newRandomGenerator(self.seed))
+    self.cards = {}
+    for _, card in ipairs(deck:getCards()) do self.cards[#self.cards + 1] = card end
 
--- Get all piles for iteration
-function KlondikeGame:getAllPiles()
-    local piles = {self.stock, self.waste}
-    for _, f in ipairs(self.foundations) do
-        table.insert(piles, f)
-    end
-    for _, t in ipairs(self.tableaus) do
-        table.insert(piles, t)
-    end
-    return piles
-end
-
--- Find pile at screen position
-function KlondikeGame:findPileAt(x, y)
-    -- Check tableaus first (they can overlap)
-    for i, tableau in ipairs(self.tableaus) do
-        if tableau:containsPoint(x, y) then
-            return tableau, "tableau", i
-        end
+    -- Everything starts face down in the stock position
+    for _, card in ipairs(self.cards) do
+        card:setFaceUp(false, true)
+        card:setPosition(self.stock.x, self.stock.y)
+        card.flying, card.dragging, card.delay = false, false, 0
     end
 
-    -- Check foundations
-    for i, foundation in ipairs(self.foundations) do
-        if foundation:containsPoint(x, y) then
-            return foundation, "foundation", i
-        end
-    end
-
-    -- Check waste
-    if self.waste:containsPoint(x, y) then
-        return self.waste, "waste", 1
-    end
-
-    -- Check stock
-    if self.stock:containsPoint(x, y) then
-        return self.stock, "stock", 1
-    end
-
-    return nil, nil, nil
-end
-
--- Handle stock click
-function KlondikeGame:clickStock()
-    if self.stock:isEmpty() then
-        -- Reset stock from waste
-        if not self.waste:isEmpty() then
-            local wasteCards = self.waste:getAllCards()
-            self.waste:clear()
-            self.stock:reset(wasteCards)
-            self.scoring:recycleWaste()
-        end
-    else
-        -- Draw cards from stock to waste
-        local drawn = {}
-        for i = 1, self.drawCount do
-            if not self.stock:isEmpty() then
-                local card = self.stock:removeCard()
-                table.insert(drawn, card)
-            end
-        end
-        self.waste:addFromStock(drawn)
-    end
-end
-
--- Try to auto-move a card to foundation
-function KlondikeGame:tryAutoMove(card, sourcePile, sourceIndex)
-    -- Try each foundation
-    for _, foundation in ipairs(self.foundations) do
-        if foundation:canAccept({card}) then
-            -- Remove card from source
-            if sourcePile == self.waste then
-                sourcePile:removeCard()
-                self.scoring:cardToFoundation()
-            else
-                sourcePile:removeCardsFrom(sourceIndex)
-                self.scoring:cardToFoundation()
-
-                -- Flip next card if tableau
-                if sourcePile.flipTopCard then
-                    if sourcePile:flipTopCard() then
-                        self.scoring:tableauFlipped()
-                    end
-                end
-            end
-
-            -- Add to foundation
-            foundation:addCard(card)
-
-            -- Check for win
-            self:checkWin()
-            return true
-        end
-    end
-    return false
-end
-
--- Start dragging cards
-function KlondikeGame:startDrag(pile, cardIndex, x, y)
-    if not pile:canPickUp(cardIndex) then
-        return false
-    end
-
-    local card = pile:getCardAt(cardIndex)
-    if not card then
-        return false
-    end
-
-    self.dragging = true
-    self.dragSource = pile
-    self.dragSourceIndex = cardIndex
-    self.dragOffsetX = x - card.x
-    self.dragOffsetY = y - card.y
-    self.dragX = x
-    self.dragY = y
-
-    -- Collect all cards being dragged
-    self.dragCards = {}
-    for i = cardIndex, pile:count() do
-        table.insert(self.dragCards, pile:getCardAt(i))
-    end
-
-    -- Highlight valid drop targets
-    self:updateDropHighlights()
-
-    return true
-end
-
--- Update drag position
-function KlondikeGame:updateDrag(x, y)
-    if not self.dragging then return end
-
-    self.dragX = x
-    self.dragY = y
-end
-
--- Update drop target highlighting
-function KlondikeGame:updateDropHighlights()
-    -- Clear all highlights
-    for _, pile in ipairs(self:getAllPiles()) do
-        pile:setHighlight(false)
-    end
-
-    if not self.dragging or #self.dragCards == 0 then
-        return
-    end
-
-    -- Highlight valid drop targets
-    for _, tableau in ipairs(self.tableaus) do
-        if tableau ~= self.dragSource and tableau:canAccept(self.dragCards) then
-            tableau:setHighlight(true)
-        end
-    end
-
-    -- Only single cards can go to foundation
-    if #self.dragCards == 1 then
-        for _, foundation in ipairs(self.foundations) do
-            if foundation:canAccept(self.dragCards) then
-                foundation:setHighlight(true)
+    -- Deal row by row like a real dealer: 1st row across 7 piles, then 6 ...
+    local order = 0
+    for row = 1, 7 do
+        for j = row, 7 do
+            local card = deck:deal()
+            local t = self.tableaus[j]
+            table.insert(t.cards, card)
+            card:setFaceUp(j == row, not animate)
+            if animate then
+                order = order + 1
+                card.delay = order * KlondikeGame.DEAL_STAGGER
+                self:launch(card)
             end
         end
     end
+    while not deck:isEmpty() do
+        local card = deck:deal()
+        table.insert(self.stock.cards, card)
+    end
+
+    for _, p in ipairs(self.piles) do p:updateCardPositions(not animate) end
+    self.dealing = animate and (order * KlondikeGame.DEAL_STAGGER + 0.35) or 0
+    self:emit("deal")
 end
 
--- Calculate rectangle overlap area
-local function getOverlapArea(x1, y1, w1, h1, x2, y2, w2, h2)
-    local overlapX = math.max(0, math.min(x1 + w1, x2 + w2) - math.max(x1, x2))
-    local overlapY = math.max(0, math.min(y1 + h1, y2 + h2) - math.max(y1, y2))
-    return overlapX * overlapY
+-- Restart the current deal from scratch
+function KlondikeGame:restartDeal(animate)
+    self:deal(self.drawCount, self.seed, animate)
 end
 
--- Calculate distance between rectangle centers
-local function getCenterDistance(x1, y1, w1, h1, x2, y2, w2, h2)
-    local cx1, cy1 = x1 + w1 / 2, y1 + h1 / 2
-    local cx2, cy2 = x2 + w2 / 2, y2 + h2 / 2
-    return math.sqrt((cx1 - cx2)^2 + (cy1 - cy2)^2)
-end
+--------------------------------------------------
+-- QUERIES
+--------------------------------------------------
 
--- Find best drop target based on card overlap
-function KlondikeGame:findBestDropTarget()
-    if not self.dragging or #self.dragCards == 0 then
-        return nil, nil
-    end
-
-    -- Calculate dragged cards bounds
-    local dragX = self.dragX - self.dragOffsetX
-    local dragY = self.dragY - self.dragOffsetY
-    local dragW = Card.WIDTH
-    local dragH = Card.HEIGHT + (#self.dragCards - 1) * Tableau.FACE_UP_SPREAD
-
-    local bestPile = nil
-    local bestPileType = nil
-    local bestOverlap = 0
-    local bestDistance = math.huge
-
-    -- Check tableaus
-    for i, tableau in ipairs(self.tableaus) do
-        if tableau ~= self.dragSource and tableau:canAccept(self.dragCards) then
-            local px, py, pw, ph = tableau:getBounds()
-            local overlap = getOverlapArea(dragX, dragY, dragW, dragH, px, py, pw, ph)
-
-            if overlap > 0 then
-                local dist = getCenterDistance(dragX, dragY, dragW, dragH, px, py, pw, ph)
-                -- Prefer larger overlap, then closer distance
-                if overlap > bestOverlap or (overlap == bestOverlap and dist < bestDistance) then
-                    bestPile = tableau
-                    bestPileType = "tableau"
-                    bestOverlap = overlap
-                    bestDistance = dist
-                end
-            end
-        end
-    end
-
-    -- Check foundations (only for single cards)
-    if #self.dragCards == 1 then
-        for i, foundation in ipairs(self.foundations) do
-            if foundation:canAccept(self.dragCards) then
-                local px, py = foundation.x, foundation.y
-                local pw, ph = Card.WIDTH, Card.HEIGHT
-                local overlap = getOverlapArea(dragX, dragY, dragW, dragH, px, py, pw, ph)
-
-                if overlap > 0 then
-                    local dist = getCenterDistance(dragX, dragY, dragW, dragH, px, py, pw, ph)
-                    if overlap > bestOverlap or (overlap == bestOverlap and dist < bestDistance) then
-                        bestPile = foundation
-                        bestPileType = "foundation"
-                        bestOverlap = overlap
-                        bestDistance = dist
-                    end
-                end
-            end
-        end
-    end
-
-    return bestPile, bestPileType
-end
-
--- End drag (drop cards)
-function KlondikeGame:endDrag(x, y)
-    if not self.dragging then return end
-
-    local dropped = false
-
-    -- Find best drop target based on card overlap
-    local pile, pileType = self:findBestDropTarget()
-
-    if pile and pile ~= self.dragSource then
-        if pile:canAccept(self.dragCards) then
-            -- Remove cards from source
-            self.dragSource:removeCardsFrom(self.dragSourceIndex)
-
-            -- Track if source was waste
-            local fromWaste = self.dragSource == self.waste
-
-            -- Add to destination
-            for _, card in ipairs(self.dragCards) do
-                pile:addCard(card)
-            end
-
-            -- Update scoring
-            if pileType == "foundation" then
-                self.scoring:cardToFoundation()
-            elseif pileType == "tableau" and fromWaste then
-                self.scoring:wasteToTableau()
-            else
-                self.scoring:generalMove()
-            end
-
-            -- Flip tableau card if needed
-            if self.dragSource.flipTopCard then
-                if self.dragSource:flipTopCard() then
-                    self.scoring:tableauFlipped()
-                end
-            end
-
-            dropped = true
-
-            -- Check for win
-            self:checkWin()
-        end
-    end
-
-    -- If not dropped, cards will animate back (handled by card:update)
-    if not dropped then
-        -- Cards are still in source pile, just need to update positions
-        self.dragSource:updateCardPositions(false)
-    end
-
-    self:cancelDrag()
-end
-
--- Cancel drag
-function KlondikeGame:cancelDrag()
-    self.dragging = false
-    self.dragCards = {}
-    self.dragSource = nil
-    self.dragSourceIndex = nil
-
-    -- Clear highlights
-    for _, pile in ipairs(self:getAllPiles()) do
-        pile:setHighlight(false)
-    end
-end
-
--- Check for win condition
-function KlondikeGame:checkWin()
-    for _, foundation in ipairs(self.foundations) do
-        if not foundation:isComplete() then
-            return false
-        end
-    end
-
-    self.state = "won"
-    self.scoring:stop()
-    return true
-end
-
--- Handle mouse press
-function KlondikeGame:mousepressed(x, y, button)
-    if self.state ~= "playing" then return end
-    if button ~= 1 then return end
-
-    local pile, pileType, pileIndex = self:findPileAt(x, y)
-
-    if not pile then
-        return
-    end
-
-    -- Handle stock click
-    if pileType == "stock" then
-        self:clickStock()
-        return
-    end
-
-    -- Find card at click position
-    local cardIndex, card = pile:findCardAtPoint(x, y)
-
-    if not card then
-        return
-    end
-
-    -- Check for double-click (auto-move to foundation)
-    local currentTime = love.timer.getTime()
-    if card == self.lastClickCard and
-       (currentTime - self.lastClickTime) < self.doubleClickThreshold then
-        -- Double-click: try auto-move
-        if card.faceUp then
-            self:tryAutoMove(card, pile, cardIndex)
-        end
-        self.lastClickCard = nil
-        return
-    end
-
-    self.lastClickTime = currentTime
-    self.lastClickCard = card
-
-    -- Start drag if card is face up
-    if card.faceUp then
-        self:startDrag(pile, cardIndex, x, y)
-    end
-end
-
--- Handle mouse release
-function KlondikeGame:mousereleased(x, y, button)
-    if button ~= 1 then return end
-
-    if self.dragging then
-        self:endDrag(x, y)
-    end
-end
-
--- Handle mouse move
-function KlondikeGame:mousemoved(x, y, dx, dy)
-    if self.dragging then
-        self:updateDrag(x, y)
-    end
-end
-
--- Update game state
-function KlondikeGame:update(dt)
-    -- Update scoring/timer
-    self.scoring:update(dt)
-
-    -- Update all card animations
-    for _, pile in ipairs(self:getAllPiles()) do
-        pile:update(dt)
-    end
-
-    -- Update drag highlights
-    if self.dragging then
-        self:updateDropHighlights()
-    end
-end
-
--- Draw the game
-function KlondikeGame:draw()
-    -- Draw felt background
-    love.graphics.setColor(0.15, 0.4, 0.2)
-    love.graphics.rectangle("fill", 0, 0, self.screenWidth, self.screenHeight)
-
-    -- Subtle texture pattern
-    love.graphics.setColor(0.12, 0.35, 0.18, 0.3)
-    for i = 0, self.screenWidth, 20 do
-        for j = 0, self.screenHeight, 20 do
-            if (i + j) % 40 == 0 then
-                love.graphics.rectangle("fill", i, j, 10, 10)
-            end
-        end
-    end
-
-    -- Draw stock
-    self.stock:draw()
-
-    -- Draw waste
-    self.waste:draw(self.dragging and self.dragSource == self.waste and self.dragSourceIndex)
-
-    -- Draw foundations
-    for i, foundation in ipairs(self.foundations) do
-        local excludeIndex = nil
-        if self.dragging and self.dragSource == foundation then
-            excludeIndex = self.dragSourceIndex
-        end
-        foundation:draw(excludeIndex)
-    end
-
-    -- Draw tableaus
-    for i, tableau in ipairs(self.tableaus) do
-        local excludeIndex = nil
-        if self.dragging and self.dragSource == tableau then
-            excludeIndex = self.dragSourceIndex
-        end
-        tableau:draw(excludeIndex)
-    end
-
-    -- Draw dragged cards
-    if self.dragging and #self.dragCards > 0 then
-        local baseX = self.dragX - self.dragOffsetX
-        local baseY = self.dragY - self.dragOffsetY
-
-        for i, card in ipairs(self.dragCards) do
-            local cardY = baseY + (i - 1) * Tableau.FACE_UP_SPREAD
-            love.graphics.push()
-            love.graphics.translate(baseX - card.x, cardY - card.y)
-            card:draw({x = 0, y = 0})
-            love.graphics.pop()
-        end
-    end
-
-    love.graphics.setColor(1, 1, 1)
-end
-
--- Get scoring for HUD
-function KlondikeGame:getScoring()
-    return self.scoring
-end
-
--- Check if game is won
 function KlondikeGame:isWon()
     return self.state == "won"
 end
 
--- New game
-function KlondikeGame:newGame()
-    self:init(self.drawCount)
+function KlondikeGame:getScoring()
+    return self.scoring
+end
+
+function KlondikeGame:hasProgress()
+    return self.scoring:getMoves() > 0 or #self.history > 0
+end
+
+-- True while input should be ignored (deal or auto-complete running)
+function KlondikeGame:isBusy()
+    return self.dealing > 0 or self.autoCompleting
+end
+
+function KlondikeGame:emit(event, data)
+    if self.listener then self.listener(event, data) end
+end
+
+-- Can the cards from `index` up on `from` legally go onto `to`?
+function KlondikeGame:canMove(from, index, to)
+    if not from or not to or from == to then return false end
+    if not from:canPickUp(index) then return false end
+    if to.kind == "foundation" then
+        -- one card at a time, and shuffling between foundations is pointless
+        if from.kind == "foundation" or index ~= from:count() then return false end
+    elseif to.kind ~= "tableau" then
+        return false
+    end
+    return to:canAccept(from:slice(index))
+end
+
+-- Every legal card move right now (draws not included)
+function KlondikeGame:legalMoves()
+    local moves = {}
+    local function try(from, index)
+        for _, to in ipairs(self.targets) do
+            if self:canMove(from, index, to) then
+                moves[#moves + 1] = {from = from, index = index, to = to}
+            end
+        end
+    end
+    if not self.waste:isEmpty() then try(self.waste, self.waste:count()) end
+    for _, f in ipairs(self.foundations) do
+        if not f:isEmpty() then try(f, f:count()) end
+    end
+    for _, t in ipairs(self.tableaus) do
+        for i = 1, t:count() do
+            if t.cards[i].faceUp and t:canPickUp(i) then try(t, i) end
+        end
+    end
+    return moves
+end
+
+-- How useful a move is, for hints. nil = not worth suggesting.
+function KlondikeGame:rankMove(m)
+    local from, to, index = m.from, m.to, m.index
+    if from.kind == "foundation" then return nil end
+
+    local revealsHidden = from.kind == "tableau" and index > 1 and not from.cards[index - 1].faceUp
+
+    if to.kind == "foundation" then
+        return revealsHidden and 120 or 100
+    end
+    if from.kind == "waste" then
+        return 60
+    end
+    -- tableau to tableau
+    if index == 1 then
+        -- emptying a column helps, unless it's a King hopping between columns
+        if to:isEmpty() then return nil end
+        return 70
+    end
+    if revealsHidden then
+        return 80 + from:hiddenCount()
+    end
+    -- splitting a face-up run only helps if it frees a card for a foundation
+    local freed = from.cards[index - 1]
+    for _, f in ipairs(self.foundations) do
+        if f:canAccept({freed}) then return 40 end
+    end
+    return nil
+end
+
+-- Best hint: a ranked card move, else {draw=true}, else nil (stuck)
+function KlondikeGame:findHint()
+    local best, bestScore = nil, -1
+    for _, m in ipairs(self:legalMoves()) do
+        local score = self:rankMove(m)
+        if score and score > bestScore then
+            best, bestScore = m, score
+        end
+    end
+    if best then return best end
+    if self:stockHasPlayableCard() then
+        return {draw = true}
+    end
+    return nil
+end
+
+-- Could any card still in the stock or waste be played somewhere?
+function KlondikeGame:stockHasPlayableCard()
+    local function playable(card)
+        for _, to in ipairs(self.targets) do
+            if to:canAccept({card}) then return true end
+        end
+        return false
+    end
+    for _, c in ipairs(self.stock.cards) do if playable(c) then return true end end
+    for _, c in ipairs(self.waste.cards) do if playable(c) then return true end end
+    return false
+end
+
+-- Where a click on this card should send it: foundation first, then a
+-- tableau that already has cards, then an empty one
+function KlondikeGame:findSmartTarget(from, index)
+    if from.kind == "foundation" then return nil end
+    local emptyTarget = nil
+    for _, to in ipairs(self.targets) do
+        if self:canMove(from, index, to) then
+            if to.kind == "tableau" and to:isEmpty() then
+                -- a King already at the bottom of a column has nowhere better to go
+                if not (from.kind == "tableau" and index == 1) then
+                    emptyTarget = emptyTarget or to
+                end
+            else
+                return to
+            end
+        end
+    end
+    return emptyTarget
+end
+
+-- All cards face up and nothing left in stock/waste: the rest is mechanical
+function KlondikeGame:canAutoComplete()
+    if self.state ~= "playing" then return false end
+    if not self.stock:isEmpty() or not self.waste:isEmpty() then return false end
+    for _, t in ipairs(self.tableaus) do
+        for _, c in ipairs(t.cards) do
+            if not c.faceUp then return false end
+        end
+    end
+    return true
+end
+
+--------------------------------------------------
+-- ACTIONS (the only code that changes the piles)
+--------------------------------------------------
+
+-- Remember the whole layout so it can be restored exactly
+function KlondikeGame:snapshot()
+    local snap = {piles = {}, faceUp = {}, fan = self.waste.fanCount, scoring = self.scoring:snapshot()}
+    for i, p in ipairs(self.piles) do
+        local copy = {}
+        for j, c in ipairs(p.cards) do copy[j] = c end
+        snap.piles[i] = copy
+    end
+    for _, c in ipairs(self.cards) do snap.faceUp[c] = c.faceUp end
+    return snap
+end
+
+function KlondikeGame:pushHistory()
+    self.history[#self.history + 1] = self:snapshot()
+end
+
+-- Mark a card as travelling between piles so it draws above the table
+function KlondikeGame:launch(card)
+    if not card.flying then
+        card.flying = true
+        self.flyLayer[#self.flyLayer + 1] = card
+    end
+end
+
+-- Move cards; returns true on success. Validates first.
+function KlondikeGame:moveCards(from, index, to)
+    if self.state ~= "playing" or not self:canMove(from, index, to) then
+        return false
+    end
+    self.scoring:begin()
+    self:pushHistory()
+    self.hint = nil
+
+    local moved = from:removeCardsFrom(index)
+    for _, card in ipairs(moved) do
+        card.dragging = false
+        self:launch(card)
+    end
+    to:addCards(moved)
+    self.scoring:onMove(from.kind, to.kind)
+
+    if from.kind == "waste" then
+        self.waste:onTopTaken()
+    elseif from.kind == "tableau" and from:flipTopCard() then
+        self.scoring:onFlip()
+        self:emit("flip", from:getTopCard())
+    end
+
+    self:emit("move", {from = from, to = to, cards = moved})
+    if to.kind == "foundation" and to:isComplete() then
+        self:emit("foundationComplete", to)
+    end
+    self:checkWin()
+    return true
+end
+
+-- Click on the stock: draw, or turn the waste back over
+function KlondikeGame:drawStock()
+    if self.state ~= "playing" then return false end
+    if self.stock:isEmpty() then
+        if self.waste:isEmpty() then
+            self:emit("invalid")
+            return false
+        end
+        self.scoring:begin()
+        self:pushHistory()
+        local cards = self.waste.cards
+        self.waste:clear()
+        self.waste.fanCount = 0
+        self.stock:reset(cards)
+        for _, c in ipairs(cards) do self:launch(c) end
+        self.scoring:onRecycle()
+        self:emit("recycle")
+    else
+        self.scoring:begin()
+        self:pushHistory()
+        local drawn = {}
+        for _ = 1, self.drawCount do
+            local card = self.stock:removeCard()
+            if not card then break end
+            self:launch(card)
+            drawn[#drawn + 1] = card
+        end
+        self.waste:addFromStock(drawn)
+        self:emit("draw", drawn)
+    end
+    self.hint = nil
+    return true
+end
+
+-- Step back one action. Cards fly home; the clock keeps running.
+function KlondikeGame:undo()
+    if #self.history == 0 or self:isBusy() then return false end
+    self:cancelDrag()
+    local snap = table.remove(self.history)
+
+    local before = {}
+    for _, p in ipairs(self.piles) do
+        for _, c in ipairs(p.cards) do before[c] = p end
+    end
+
+    for i, p in ipairs(self.piles) do
+        p:setCards(snap.piles[i])
+        for _, c in ipairs(p.cards) do
+            if before[c] ~= p then self:launch(c) end
+        end
+    end
+    for c, up in pairs(snap.faceUp) do
+        c:setFaceUp(up, false)
+    end
+    self.waste.fanCount = snap.fan
+    self.scoring:restore(snap.scoring)
+    for _, p in ipairs(self.piles) do p:updateCardPositions() end
+
+    self.state = "playing"
+    self.scoring.finished = false
+    self.autoCompleting = false
+    self.hint = nil
+    self:emit("undo")
+    return true
+end
+
+-- Start auto-completing (moves run from update)
+function KlondikeGame:startAutoComplete()
+    if not self:canAutoComplete() then return false end
+    self:cancelDrag()
+    self.autoCompleting = true
+    self.autoTimer = 0
+    return true
+end
+
+-- One auto-complete step: lowest card that can go up goes up
+function KlondikeGame:autoStep()
+    local best, bestFrom, bestTo = nil, nil, nil
+    for _, t in ipairs(self.tableaus) do
+        local top = t:getTopCard()
+        if top and (not best or top.value < best.value) then
+            for _, f in ipairs(self.foundations) do
+                if f:canAccept({top}) then
+                    best, bestFrom, bestTo = top, t, f
+                    break
+                end
+            end
+        end
+    end
+    if best then
+        return self:moveCards(bestFrom, bestFrom:count(), bestTo)
+    end
+    return false
+end
+
+-- Show a hint; returns the hint (or nil when stuck)
+function KlondikeGame:showHint()
+    local h = self:findHint()
+    self.hint = h and {move = h, time = 0} or nil
+    return h
+end
+
+function KlondikeGame:checkWin()
+    for _, f in ipairs(self.foundations) do
+        if not f:isComplete() then return false end
+    end
+    self.state = "won"
+    self.autoCompleting = false
+    self.scoring:stop()
+    self:emit("win")
+    return true
+end
+
+--------------------------------------------------
+-- POINTER INPUT
+--------------------------------------------------
+
+-- Topmost pile and card under a point
+function KlondikeGame:hitTest(x, y)
+    for _, t in ipairs(self.tableaus) do
+        local i, card = t:findCardAtPoint(x, y)
+        if card then return t, i, card end
+        if t:isEmpty() and t:containsPoint(x, y) then return t end
+    end
+    local i, card = self.waste:findCardAtPoint(x, y)
+    if card then return self.waste, i, card end
+    for _, f in ipairs(self.foundations) do
+        if f:containsPoint(x, y) then
+            local n = f:count()
+            return f, n > 0 and n or nil, f:getTopCard()
+        end
+    end
+    if self.stock:containsPoint(x, y) then return self.stock end
+    return nil
+end
+
+-- What the pointer can act on (for the hand cursor)
+function KlondikeGame:isInteractiveAt(x, y)
+    if self.state ~= "playing" or self:isBusy() then return false end
+    local pile, index, card = self:hitTest(x, y)
+    if pile == self.stock then return true end
+    return card ~= nil and card.faceUp and pile:canPickUp(index)
+end
+
+function KlondikeGame:mousepressed(x, y, button)
+    if button ~= 1 or self.state ~= "playing" or self:isBusy() then return end
+    local pile, index, card = self:hitTest(x, y)
+    if not pile then return end
+
+    if pile == self.stock then
+        self:drawStock()
+        return
+    end
+    if card and card.faceUp and pile:canPickUp(index) then
+        self.press = {pile = pile, index = index, x = x, y = y, offX = x - card.x, offY = y - card.y}
+    end
+end
+
+function KlondikeGame:mousemoved(x, y)
+    self.mouseX, self.mouseY = x, y
+    local p = self.press
+    if p and not self.drag then
+        local dx, dy = x - p.x, y - p.y
+        if dx * dx + dy * dy > KlondikeGame.DRAG_THRESHOLD ^ 2 then
+            self:beginDrag()
+        end
+    end
+    if self.drag then
+        self:positionDragCards()
+    end
+end
+
+function KlondikeGame:mousereleased(x, y, button)
+    if button ~= 1 then return end
+    if self.drag then
+        self:endDrag()
+    elseif self.press then
+        local p = self.press
+        self.press = nil
+        local to = self:findSmartTarget(p.pile, p.index)
+        if not (to and self:moveCards(p.pile, p.index, to)) and p.pile.kind ~= "foundation" then
+            local card = p.pile:getCardAt(p.index)
+            if card then card.shake = 1 end
+            self:emit("invalid")
+        end
+    end
+    self.press = nil
+end
+
+function KlondikeGame:beginDrag()
+    local p = self.press
+    self.press = nil
+    local cards = p.pile:slice(p.index)
+    local base = cards[1]
+    local offsets = {}
+    for i, c in ipairs(cards) do
+        -- keep each card's spacing exactly as it was in the pile
+        offsets[i] = {c.targetX - base.targetX, c.targetY - base.targetY}
+        c.dragging = true
+        c.animating = false
+    end
+    self.drag = {
+        pile = p.pile, index = p.index, cards = cards, offsets = offsets,
+        offX = p.offX, offY = p.offY, tilt = 0, lastX = self.mouseX,
+    }
+    self.hint = nil
+    self:positionDragCards()
+    self:emit("pickup", cards)
+end
+
+function KlondikeGame:positionDragCards()
+    local d = self.drag
+    local bx, by = self.mouseX - d.offX, self.mouseY - d.offY
+    for i, c in ipairs(d.cards) do
+        c.x, c.y = bx + d.offsets[i][1], by + d.offsets[i][2]
+        c.targetX, c.targetY = c.x, c.y
+    end
+end
+
+-- Bounds of the dragged stack
+function KlondikeGame:dragBounds()
+    local d = self.drag
+    local first, last = d.cards[1], d.cards[#d.cards]
+    return first.x, first.y, Card.WIDTH, (last.y - first.y) + Card.HEIGHT
+end
+
+local function overlapArea(x1, y1, w1, h1, x2, y2, w2, h2)
+    local ox = math.max(0, math.min(x1 + w1, x2 + w2) - math.max(x1, x2))
+    local oy = math.max(0, math.min(y1 + h1, y2 + h2) - math.max(y1, y2))
+    return ox * oy
+end
+
+-- Valid pile the dragged cards overlap most (ties: nearest centre)
+function KlondikeGame:findDropTarget()
+    local d = self.drag
+    if not d then return nil end
+    local x, y, w, h = self:dragBounds()
+    -- only the top card's footprint matters for single cards; for runs the
+    -- leading card decides, so use the first card's box
+    h = Card.HEIGHT
+    local best, bestArea, bestDist = nil, 0, math.huge
+    for _, to in ipairs(self.targets) do
+        if self:canMove(d.pile, d.index, to) then
+            local px, py, pw, ph = to:getBounds()
+            if to.kind == "tableau" and not to:isEmpty() then
+                -- the landing spot is the pile's top card
+                px, py = to:cardPosition(to:count())
+                pw, ph = Card.WIDTH, Card.HEIGHT
+            end
+            local area = overlapArea(x, y, w, h, px, py, pw, ph)
+            if area > 0 then
+                local dist = (x + w / 2 - (px + pw / 2)) ^ 2 + (y + h / 2 - (py + ph / 2)) ^ 2
+                if area > bestArea or (area == bestArea and dist < bestDist) then
+                    best, bestArea, bestDist = to, area, dist
+                end
+            end
+        end
+    end
+    return best
+end
+
+function KlondikeGame:endDrag()
+    local d = self.drag
+    local to = self:findDropTarget()
+    self.drag = nil
+    if to and self:moveCards(d.pile, d.index, to) then
+        return
+    end
+    -- no valid target: the cards glide home
+    for _, c in ipairs(d.cards) do
+        c.dragging = false
+        self:launch(c)
+    end
+    d.pile:updateCardPositions()
+    self:emit("return", d.cards)
+end
+
+function KlondikeGame:cancelDrag()
+    if self.drag then
+        local d = self.drag
+        self.drag = nil
+        for _, c in ipairs(d.cards) do
+            c.dragging = false
+            self:launch(c)
+        end
+        d.pile:updateCardPositions()
+    end
+    self.press = nil
+end
+
+--------------------------------------------------
+-- UPDATE / DRAW
+--------------------------------------------------
+
+function KlondikeGame:update(dt, paused)
+    if not paused and self.dealing <= 0 then
+        self.scoring:update(dt)
+    end
+    if self.dealing > 0 then
+        self.dealing = math.max(0, self.dealing - dt)
+    end
+
+    for _, c in ipairs(self.cards) do
+        if c.delay and c.delay > 0 then
+            c.delay = c.delay - dt
+            if c.delay <= 0 then c.delay = 0 end
+        else
+            c:update(dt)
+        end
+        if c.shake and c.shake > 0 then
+            c.shake = math.max(0, c.shake - dt * 3)
+        end
+    end
+
+    -- drop settled cards from the flight layer
+    for i = #self.flyLayer, 1, -1 do
+        if not self.flyLayer[i].flying then table.remove(self.flyLayer, i) end
+    end
+
+    if self.drag then
+        local d = self.drag
+        local vx = (self.mouseX - d.lastX) / math.max(dt, 1e-3)
+        d.lastX = self.mouseX
+        local target = math.max(-1, math.min(1, vx / 1500)) * 0.08
+        d.tilt = d.tilt + (target - d.tilt) * math.min(1, dt * 12)
+    end
+
+    if self.autoCompleting then
+        self.autoTimer = self.autoTimer - dt
+        if self.autoTimer <= 0 then
+            self.autoTimer = KlondikeGame.AUTO_STEP
+            if not self:autoStep() then self.autoCompleting = false end
+        end
+    end
+
+    if self.hint then
+        self.hint.time = self.hint.time + dt
+        if self.hint.time > 2.4 then self.hint = nil end
+    end
+end
+
+-- Valid drop targets for the current drag (for highlighting)
+function KlondikeGame:dropTargets()
+    local list = {}
+    local d = self.drag
+    if not d then return list end
+    for _, to in ipairs(self.targets) do
+        if self:canMove(d.pile, d.index, to) then list[#list + 1] = to end
+    end
+    return list
+end
+
+-- Draw cards only; the table, slots and glows are drawn by the caller
+function KlondikeGame:drawCards()
+    self.stock:draw()
+    self.waste:draw()
+    for _, f in ipairs(self.foundations) do f:draw() end
+    for _, t in ipairs(self.tableaus) do t:draw() end
+    for _, c in ipairs(self.flyLayer) do
+        if not c.dragging and (c.delay or 0) <= 0 then c:draw() end
+    end
+    -- cards still waiting to be dealt sit on the stock, last-dealt underneath
+    for i = #self.cards, 1, -1 do
+        local c = self.cards[i]
+        if (c.delay or 0) > 0 then c:draw() end
+    end
+    if self.drag then
+        for _, c in ipairs(self.drag.cards) do c:draw({lifted = true, tilt = self.drag.tilt}) end
+    end
+    love.graphics.setColor(1, 1, 1)
 end
 
 return KlondikeGame

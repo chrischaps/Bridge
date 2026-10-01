@@ -29,6 +29,8 @@ function Card.new(suit, rank)
 
     self.suit = suit
     self.rank = rank
+    self.value = Card.valueOf(rank)
+    self.red = suit == "hearts" or suit == "diamonds"
     self.faceUp = false
 
     -- Position
@@ -45,6 +47,8 @@ function Card.new(suit, rank)
     -- Animation state
     self.animating = false
     self.animSpeed = 12  -- Animation speed multiplier
+    self.flying = false    -- travelling between piles; drawn above the table
+    self.dragging = false  -- held under the pointer
 
     -- Flip animation
     self.flipProgress = 0  -- 0 = fully back, 1 = fully face
@@ -54,19 +58,24 @@ function Card.new(suit, rank)
     return self
 end
 
--- Check if card is red
-function Card:isRed()
-    return self.suit == "hearts" or self.suit == "diamonds"
-end
-
--- Get numeric value (Ace = 1, 2-10 = face value, J/Q/K = 11/12/13)
-function Card:getValue()
+-- Numeric value of a rank (Ace = 1 ... King = 13)
+function Card.valueOf(rank)
     for i, r in ipairs(Card.RANKS) do
-        if r == self.rank then
+        if r == rank then
             return i
         end
     end
     return 0
+end
+
+-- Check if card is red
+function Card:isRed()
+    return self.red
+end
+
+-- Get numeric value (Ace = 1, 2-10 = face value, J/Q/K = 11/12/13)
+function Card:getValue()
+    return self.value
 end
 
 -- Set position immediately
@@ -85,7 +94,8 @@ function Card:moveTo(x, y, immediate)
         self.x = x
         self.y = y
         self.animating = false
-    else
+        self.flying = false
+    elseif math.abs(x - self.x) > 0.5 or math.abs(y - self.y) > 0.5 then
         self.animating = true
     end
 end
@@ -121,11 +131,15 @@ function Card:update(dt)
             self.x = self.targetX
             self.y = self.targetY
             self.animating = false
+            self.flying = false
         else
             local factor = 1 - math.pow(0.01, dt * self.animSpeed)
             self.x = self.x + dx * factor
             self.y = self.y + dy * factor
         end
+    end
+    if not self.animating then
+        self.flying = false
     end
 
     -- Flip animation
@@ -357,16 +371,11 @@ function Card.getPipPositions(value)
 end
 
 -- Main draw function
-function Card:draw(dragOffset)
+function Card:draw(opts)
     local x, y = self.x, self.y
     local w, h = Card.WIDTH, Card.HEIGHT
     local r = Card.CORNER_RADIUS
-
-    -- Apply drag offset if provided
-    if dragOffset then
-        x = x + dragOffset.x
-        y = y + dragOffset.y
-    end
+    local dragOffset = opts and opts.lifted
 
     -- Calculate flip scale (for flip animation)
     local flipScale = 1

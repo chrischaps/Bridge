@@ -7,12 +7,15 @@ local Pile = {}
 Pile.__index = Pile
 
 -- Create a new pile
-function Pile.new(x, y)
+-- kind: "stock" | "waste" | "foundation" | "tableau" (used by move rules)
+function Pile.new(x, y, kind, index)
     local self = setmetatable({}, Pile)
 
     self.cards = {}
     self.x = x or 0
     self.y = y or 0
+    self.kind = kind or "pile"
+    self.index = index or 1
 
     -- Card spread (for fanned piles)
     self.spreadX = 0
@@ -20,7 +23,7 @@ function Pile.new(x, y)
 
     -- Visual properties
     self.highlighted = false
-    self.highlightColor = {0.3, 0.7, 0.4, 0.4}
+    self.highlightStrength = 0
 
     return self
 end
@@ -49,18 +52,6 @@ function Pile:removeCard()
     return card
 end
 
--- Remove and return multiple cards from the top
-function Pile:removeCards(count)
-    local removed = {}
-    for i = 1, count do
-        if #self.cards > 0 then
-            table.insert(removed, 1, table.remove(self.cards))
-        end
-    end
-    self:updateCardPositions()
-    return removed
-end
-
 -- Remove cards from a specific index to the end
 function Pile:removeCardsFrom(index)
     local removed = {}
@@ -69,6 +60,15 @@ function Pile:removeCardsFrom(index)
     end
     self:updateCardPositions()
     return removed
+end
+
+-- Copy of the cards from index to the top (without removing them)
+function Pile:slice(index)
+    local cards = {}
+    for i = index, #self.cards do
+        cards[#cards + 1] = self.cards[i]
+    end
+    return cards
 end
 
 -- Get the top card without removing it
@@ -91,9 +91,9 @@ function Pile:count()
     return #self.cards
 end
 
--- Get all cards
-function Pile:getCards()
-    return self.cards
+-- Replace the pile's contents (used by undo); positions are not touched
+function Pile:setCards(cards)
+    self.cards = cards
 end
 
 -- Clear all cards from pile
@@ -101,13 +101,17 @@ function Pile:clear()
     self.cards = {}
 end
 
+-- Where the card at index i rests
+function Pile:cardPosition(i)
+    return self.x + (i - 1) * self.spreadX, self.y + (i - 1) * self.spreadY
+end
+
 -- Update card positions based on pile position and spread
 function Pile:updateCardPositions(immediate)
     for i, card in ipairs(self.cards) do
-        local targetX = self.x + (i - 1) * self.spreadX
-        local targetY = self.y + (i - 1) * self.spreadY
+        local tx, ty = self:cardPosition(i)
         card.zIndex = i
-        card:moveTo(targetX, targetY, immediate)
+        card:moveTo(tx, ty, immediate)
     end
 end
 
@@ -118,27 +122,25 @@ function Pile:setPosition(x, y)
     self:updateCardPositions(true)
 end
 
--- Set card spread
-function Pile:setSpread(spreadX, spreadY)
-    self.spreadX = spreadX or 0
-    self.spreadY = spreadY or 0
-    self:updateCardPositions(true)
+-- Pile bounds (x, y, w, h) from the resting positions of its cards
+function Pile:getBounds()
+    local w, h = Card.WIDTH, Card.HEIGHT
+    if #self.cards > 1 then
+        local lx, ly = self:cardPosition(#self.cards)
+        w = (lx - self.x) + Card.WIDTH
+        h = (ly - self.y) + Card.HEIGHT
+    end
+    return self.x, self.y, w, h
 end
 
 -- Check if point is inside pile bounds
 function Pile:containsPoint(px, py)
-    -- Get pile bounds
-    local left = self.x
-    local top = self.y
-    local right = self.x + Card.WIDTH + math.abs(self.spreadX) * math.max(0, #self.cards - 1)
-    local bottom = self.y + Card.HEIGHT + math.abs(self.spreadY) * math.max(0, #self.cards - 1)
-
-    return px >= left and px <= right and py >= top and py <= bottom
+    local x, y, w, h = self:getBounds()
+    return px >= x and px <= x + w and py >= y and py <= y + h
 end
 
 -- Find which card in the pile contains a point (returns index and card)
 function Pile:findCardAtPoint(px, py)
-    -- Check from top to bottom (reverse order)
     for i = #self.cards, 1, -1 do
         local card = self.cards[i]
         if card:containsPoint(px, py) then
@@ -170,50 +172,25 @@ function Pile:update(dt)
     end
 end
 
--- Draw empty pile placeholder
-function Pile:drawPlaceholder()
-    love.graphics.setColor(0.2, 0.35, 0.2, 0.5)
-    love.graphics.setLineWidth(2)
-    love.graphics.rectangle("line", self.x, self.y, Card.WIDTH, Card.HEIGHT, Card.CORNER_RADIUS)
+-- True when the card is resting in this pile (not in flight or held)
+function Pile.isResting(card)
+    return not card.flying and not card.dragging
+end
 
-    if self.highlighted then
-        love.graphics.setColor(self.highlightColor)
-        love.graphics.rectangle("fill", self.x, self.y, Card.WIDTH, Card.HEIGHT, Card.CORNER_RADIUS)
+-- Draw resting cards from index `first` to the top
+function Pile:drawCards(first)
+    for i = first or 1, #self.cards do
+        local card = self.cards[i]
+        if Pile.isResting(card) then
+            card:draw()
+        end
     end
 end
 
 -- Draw the pile
-function Pile:draw(excludeFromIndex)
-    -- Draw placeholder if empty
-    if #self.cards == 0 then
-        self:drawPlaceholder()
-        return
-    end
-
-    -- Draw highlight behind cards
-    if self.highlighted then
-        local right = self.x + Card.WIDTH + self.spreadX * math.max(0, #self.cards - 1)
-        local bottom = self.y + Card.HEIGHT + self.spreadY * math.max(0, #self.cards - 1)
-        love.graphics.setColor(self.highlightColor)
-        love.graphics.rectangle("fill", self.x - 2, self.y - 2,
-            right - self.x + 4, bottom - self.y + 4, Card.CORNER_RADIUS + 2)
-    end
-
-    -- Draw cards
-    local endIndex = excludeFromIndex and (excludeFromIndex - 1) or #self.cards
-    for i = 1, endIndex do
-        local card = self.cards[i]
-        card:draw()
-    end
-
+function Pile:draw()
+    self:drawCards(1)
     love.graphics.setColor(1, 1, 1)
-end
-
--- Get pile bounds for collision detection
-function Pile:getBounds()
-    local width = Card.WIDTH + math.abs(self.spreadX) * math.max(0, #self.cards - 1)
-    local height = Card.HEIGHT + math.abs(self.spreadY) * math.max(0, #self.cards - 1)
-    return self.x, self.y, width, height
 end
 
 return Pile

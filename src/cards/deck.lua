@@ -28,10 +28,12 @@ function Deck:create()
 end
 
 -- Fisher-Yates shuffle algorithm
-function Deck:shuffle()
+-- rng: optional love.math RandomGenerator so a deal can be replayed from its seed
+function Deck:shuffle(rng)
+    local random = rng and function(a, b) return rng:random(a, b) end or math.random
     local n = #self.cards
     for i = n, 2, -1 do
-        local j = math.random(1, i)
+        local j = random(1, i)
         self.cards[i], self.cards[j] = self.cards[j], self.cards[i]
     end
     return self

@@ -3,38 +3,60 @@
 -- Only Kings can be placed on empty tableau piles
 
 local Pile = require("src.cards.pile")
-local Card = require("src.cards.card")
 
 local Tableau = setmetatable({}, {__index = Pile})
 Tableau.__index = Tableau
 
--- Spread constants
-Tableau.FACE_DOWN_SPREAD = 4
-Tableau.FACE_UP_SPREAD = 20
+-- Spread constants (compressed when a column would run past maxBottom)
+Tableau.FACE_DOWN_SPREAD = 8
+Tableau.FACE_UP_SPREAD = 26
+Tableau.MIN_FACE_DOWN_SPREAD = 4
+Tableau.MIN_FACE_UP_SPREAD = 13
 
 -- Create a new tableau pile
-function Tableau.new(x, y)
-    local self = setmetatable(Pile.new(x, y), Tableau)
-    self.spreadY = Tableau.FACE_UP_SPREAD
+function Tableau.new(x, y, index)
+    local self = setmetatable(Pile.new(x, y, "tableau", index), Tableau)
+    self.maxBottom = math.huge  -- lowest y the last card may reach
+    self.offsets = {}
     return self
+end
+
+-- Work out each card's y offset, squeezing spreads to fit above maxBottom
+function Tableau:computeOffsets()
+    local Card = require("src.cards.card")
+    local n = #self.cards
+    local down, up = 0, 0
+    for i = 1, n - 1 do
+        if self.cards[i].faceUp then up = up + 1 else down = down + 1 end
+    end
+
+    local fd, fu = Tableau.FACE_DOWN_SPREAD, Tableau.FACE_UP_SPREAD
+    local available = self.maxBottom - self.y - Card.HEIGHT
+    if down * fd + up * fu > available then
+        if up > 0 then
+            fu = math.max(Tableau.MIN_FACE_UP_SPREAD, (available - down * fd) / up)
+        end
+        if down > 0 and down * fd + up * fu > available then
+            fd = math.max(Tableau.MIN_FACE_DOWN_SPREAD, (available - up * fu) / down)
+        end
+    end
+
+    local offsets, y = {}, 0
+    for i = 1, n do
+        offsets[i] = y
+        y = y + (self.cards[i].faceUp and fu or fd)
+    end
+    self.offsets = offsets
+end
+
+function Tableau:cardPosition(i)
+    return self.x, self.y + (self.offsets[i] or 0)
 end
 
 -- Update card positions with variable spread for face-up/face-down
 function Tableau:updateCardPositions(immediate)
-    local yOffset = 0
-    for i, card in ipairs(self.cards) do
-        local targetX = self.x
-        local targetY = self.y + yOffset
-        card.zIndex = i
-        card:moveTo(targetX, targetY, immediate)
-
-        -- Use smaller spread for face-down cards
-        if card.faceUp then
-            yOffset = yOffset + Tableau.FACE_UP_SPREAD
-        else
-            yOffset = yOffset + Tableau.FACE_DOWN_SPREAD
-        end
-    end
+    self:computeOffsets()
+    Pile.updateCardPositions(self, immediate)
 end
 
 -- Check if cards can be accepted (Klondike rules)
@@ -47,16 +69,13 @@ function Tableau:canAccept(cards)
 
     -- Empty tableau: only Kings allowed
     if self:isEmpty() then
-        return bottomCard:getValue() == 13  -- King
+        return bottomCard.value == 13
     end
 
     local topCard = self:getTopCard()
-
-    -- Must be opposite color and one rank lower
-    local oppositeColor = topCard:isRed() ~= bottomCard:isRed()
-    local oneRankLower = bottomCard:getValue() == topCard:getValue() - 1
-
-    return oppositeColor and oneRankLower
+    return topCard.faceUp
+        and topCard.red ~= bottomCard.red
+        and bottomCard.value == topCard.value - 1
 end
 
 -- Check if cards can be picked up from given index
@@ -66,21 +85,15 @@ function Tableau:canPickUp(index)
     end
 
     -- Can only pick up face-up cards
-    local card = self.cards[index]
-    if not card.faceUp then
+    if not self.cards[index].faceUp then
         return false
     end
 
     -- All cards from index to top must form valid descending sequence
     for i = index, #self.cards - 1 do
         local current = self.cards[i]
-        local next = self.cards[i + 1]
-
-        -- Must alternate colors and descend by one
-        if current:isRed() == next:isRed() then
-            return false
-        end
-        if next:getValue() ~= current:getValue() - 1 then
+        local nextCard = self.cards[i + 1]
+        if current.red == nextCard.red or nextCard.value ~= current.value - 1 then
             return false
         end
     end
@@ -88,15 +101,13 @@ function Tableau:canPickUp(index)
     return true
 end
 
--- Override findCardAtPoint to account for variable spread
+-- Hit-test against resting positions so moving cards don't shift targets
 function Tableau:findCardAtPoint(px, py)
-    -- Check from top to bottom (reverse order)
+    local Card = require("src.cards.card")
     for i = #self.cards, 1, -1 do
-        local card = self.cards[i]
-        -- Use actual card position for hit testing
-        if px >= card.x and px <= card.x + Card.WIDTH and
-           py >= card.y and py <= card.y + Card.HEIGHT then
-            return i, card
+        local cx, cy = self:cardPosition(i)
+        if px >= cx and px <= cx + Card.WIDTH and py >= cy and py <= cy + Card.HEIGHT then
+            return i, self.cards[i]
         end
     end
     return nil, nil
@@ -107,67 +118,19 @@ function Tableau:flipTopCard()
     local topCard = self:getTopCard()
     if topCard and not topCard.faceUp then
         topCard:setFaceUp(true, false)
+        self:updateCardPositions()
         return true
     end
     return false
 end
 
--- Check if pile contains point (override for variable height)
-function Tableau:containsPoint(px, py)
-    if #self.cards == 0 then
-        return px >= self.x and px <= self.x + Card.WIDTH and
-               py >= self.y and py <= self.y + Card.HEIGHT
+-- Number of face-down cards
+function Tableau:hiddenCount()
+    local n = 0
+    for _, card in ipairs(self.cards) do
+        if not card.faceUp then n = n + 1 end
     end
-
-    -- Calculate actual pile height
-    local lastCard = self.cards[#self.cards]
-    local bottom = lastCard.y + Card.HEIGHT
-
-    return px >= self.x and px <= self.x + Card.WIDTH and
-           py >= self.y and py <= bottom
-end
-
--- Get pile bounds (override for variable height)
-function Tableau:getBounds()
-    local height = Card.HEIGHT
-    if #self.cards > 0 then
-        local lastCard = self.cards[#self.cards]
-        height = (lastCard.y - self.y) + Card.HEIGHT
-    end
-    return self.x, self.y, Card.WIDTH, height
-end
-
--- Draw the tableau pile
-function Tableau:draw(excludeFromIndex)
-    -- Draw placeholder if empty
-    if #self.cards == 0 then
-        -- Draw a subtle outline for empty tableau
-        love.graphics.setColor(0.2, 0.35, 0.2, 0.3)
-        love.graphics.setLineWidth(2)
-        love.graphics.rectangle("line", self.x, self.y, Card.WIDTH, Card.HEIGHT, Card.CORNER_RADIUS)
-
-        if self.highlighted then
-            love.graphics.setColor(self.highlightColor)
-            love.graphics.rectangle("fill", self.x, self.y, Card.WIDTH, Card.HEIGHT, Card.CORNER_RADIUS)
-        end
-        return
-    end
-
-    -- Draw highlight behind cards if highlighted
-    if self.highlighted then
-        local _, _, w, h = self:getBounds()
-        love.graphics.setColor(self.highlightColor)
-        love.graphics.rectangle("fill", self.x - 2, self.y - 2, w + 4, h + 4, Card.CORNER_RADIUS + 2)
-    end
-
-    -- Draw cards
-    local endIndex = excludeFromIndex and (excludeFromIndex - 1) or #self.cards
-    for i = 1, endIndex do
-        local card = self.cards[i]
-        card:draw()
-    end
-
-    love.graphics.setColor(1, 1, 1)
+    return n
 end
 
 return Tableau
