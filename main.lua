@@ -78,8 +78,10 @@ end
 -- Rasterise fonts, faces and the table for the current window size
 local function rescale()
     renderScale = Theme.windowScale(VW, VH)
-    Theme.rebuild(renderScale)
-    Card.setRenderScale(renderScale)
+    -- close-up captures paint cards and type at a higher density
+    local zoom = shot and shot:zoom() or 1
+    Theme.rebuild(renderScale * zoom)
+    Card.setRenderScale(renderScale * zoom)
 end
 
 local function closePanel(after)
@@ -432,8 +434,10 @@ function love.load(args)
             setDrawMode = function(n) drawMode = n buttons.draw:setText("Draw " .. n) end,
             showStats = showStats,
             showWin = function() showWinPanel() end,
+            clearEffects = function() stopCascade() Sparkle.clear() end,
             hud = hud,
         })
+        rescale()
         Card.prewarm(game.cards)
     else
         game:deal(drawMode, nil, true)
@@ -489,27 +493,14 @@ function love.update(dt)
     if shot then shot:update(dt) end
 end
 
--- Every card face and the back, for checking the art
-local function drawGallery()
-    local cards = game.cards
-    table.sort(cards, function(a, b)
-        if a.suit ~= b.suit then return a.suit < b.suit end
-        return a.value < b.value
-    end)
-    local s = 0.78
-    for i, c in ipairs(cards) do
-        local col, row = (i - 1) % 13, math.floor((i - 1) / 13)
-        c:drawAt(14 + col * 66, 14 + row * 96, s, true)
-    end
-    cards[1]:drawAt(14 + 12 * 66 - 70, 14 + 4 * 96, s, false)
-end
-
 function love.draw()
     scaling.start()
 
     Table.draw(VW, VH, renderScale)
-    if shot and shot:isGallery() then
-        drawGallery()
+    local custom = shot and shot:customDraw()
+    if custom then
+        custom()
+        Sparkle.draw()
         scaling.stop()
         shot:afterDraw()
         return
@@ -540,6 +531,7 @@ function love.resize(w, h)
 end
 
 function love.mousepressed(x, y, button)
+    if shot then return end -- captures steer their own pointer
     local vx, vy = scaling.toVirtual(x, y)
     if panel then panel:mousepressed(vx, vy, button) return end
     if cascade then
@@ -554,6 +546,7 @@ function love.mousepressed(x, y, button)
 end
 
 function love.mousereleased(x, y, button)
+    if shot then return end
     local vx, vy = scaling.toVirtual(x, y)
     if panel then panel:mousereleased(vx, vy, button) return end
     for _, b in ipairs(railButtons) do b:mousereleased(vx, vy, button) end
@@ -561,6 +554,7 @@ function love.mousereleased(x, y, button)
 end
 
 function love.mousemoved(x, y)
+    if shot then return end
     local vx, vy = scaling.toVirtual(x, y)
     if panel then
         panel:mousemoved(vx, vy)

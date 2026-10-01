@@ -181,9 +181,19 @@ local function paintPaper(w, h, r)
     love.graphics.rectangle("fill", 0, 0, w, h, r, r)
     Theme.setColor(C.paper)
     love.graphics.rectangle("fill", 1.5, 1.5, w - 3, h - 3, r - 1, r - 1)
-    -- a faint sheen across the top half
+    -- a faint sheen that fades out down the top half
     love.graphics.setColor(1, 1, 1, 0.18)
-    love.graphics.rectangle("fill", 2, 2, w - 4, h * 0.45, r - 1, r - 1)
+    love.graphics.rectangle("fill", 2, 2, w - 4, r * 2, r - 1, r - 1)
+    local sheen = Card.sheenMesh
+    if not sheen then
+        sheen = love.graphics.newMesh({
+            {0, 0, 0, 0, 1, 1, 1, 0.18}, {1, 0, 0, 0, 1, 1, 1, 0.18},
+            {1, 1, 0, 0, 1, 1, 1, 0}, {0, 1, 0, 0, 1, 1, 1, 0},
+        }, "fan", "static")
+        Card.sheenMesh = sheen
+    end
+    love.graphics.setColor(1, 1, 1)
+    love.graphics.draw(sheen, 2, 2 + r * 2, 0, w - 4, h * 0.5 - r * 2)
     Theme.setColor(C.paperLine, 0.75)
     love.graphics.setLineWidth(0.8)
     love.graphics.rectangle("line", 0.4, 0.4, w - 0.8, h - 0.8, r, r)
