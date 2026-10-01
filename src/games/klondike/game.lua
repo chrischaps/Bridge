@@ -128,6 +128,7 @@ function KlondikeGame:deal(drawCount, seed, animate)
         card:setFaceUp(false, true)
         card:setPosition(self.stock.x, self.stock.y)
         card.flying, card.dragging, card.delay = false, false, 0
+        card.hidden, card.shake, card.lift = false, 0, 0
     end
 
     -- Deal row by row like a real dealer: 1st row across 7 piles, then 6 ...
@@ -531,6 +532,11 @@ end
 
 function KlondikeGame:mousemoved(x, y)
     self.mouseX, self.mouseY = x, y
+    self.hoverCard = nil
+    if not self.drag and not self.press and self:isInteractiveAt(x, y) then
+        local _, _, card = self:hitTest(x, y)
+        self.hoverCard = card
+    end
     local p = self.press
     if p and not self.drag then
         local dx, dy = x - p.x, y - p.y
@@ -680,9 +686,11 @@ function KlondikeGame:update(dt, paused)
         else
             c:update(dt)
         end
-        if c.shake and c.shake > 0 then
+        if c.shake > 0 then
             c.shake = math.max(0, c.shake - dt * 3)
         end
+        local lift = (c == self.hoverCard and not self.drag) and 1 or 0
+        c.lift = c.lift + (lift - c.lift) * math.min(1, dt * 16)
     end
 
     -- drop settled cards from the flight layer
@@ -730,12 +738,12 @@ function KlondikeGame:drawCards()
     for _, f in ipairs(self.foundations) do f:draw() end
     for _, t in ipairs(self.tableaus) do t:draw() end
     for _, c in ipairs(self.flyLayer) do
-        if not c.dragging and (c.delay or 0) <= 0 then c:draw() end
+        if not c.dragging and not c.hidden and c.delay <= 0 then c:draw() end
     end
     -- cards still waiting to be dealt sit on the stock, last-dealt underneath
     for i = #self.cards, 1, -1 do
         local c = self.cards[i]
-        if (c.delay or 0) > 0 then c:draw() end
+        if c.delay > 0 then c:draw() end
     end
     if self.drag then
         for _, c in ipairs(self.drag.cards) do c:draw({lifted = true, tilt = self.drag.tilt}) end

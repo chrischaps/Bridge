@@ -1,95 +1,57 @@
--- Simple button UI component
--- Handles rendering and click detection
+-- Engraved brass-plate button for the rail and panels
+
+local Theme = require("src.ui.theme")
 
 local Button = {}
 Button.__index = Button
 
--- Default colors
-Button.COLORS = {
-    normal = {0.2, 0.4, 0.3, 0.9},
-    hover = {0.25, 0.5, 0.35, 0.95},
-    pressed = {0.15, 0.35, 0.25, 1},
-    text = {1, 1, 1, 1},
-    border = {0.3, 0.5, 0.4, 1},
-}
-
--- Create a new button
-function Button.new(x, y, width, height, text, onClick)
+-- style: "plate" (walnut with brass rim) or "gold" (the call to action)
+function Button.new(x, y, width, height, text, onClick, style)
     local self = setmetatable({}, Button)
-
-    self.x = x
-    self.y = y
-    self.width = width
-    self.height = height
+    self.x, self.y = x, y
+    self.width, self.height = width, height
     self.text = text or ""
     self.onClick = onClick
+    self.style = style or "plate"
 
-    -- State
     self.hovered = false
     self.pressed = false
     self.enabled = true
     self.visible = true
-
-    -- Customization
-    self.colors = {}
-    for k, v in pairs(Button.COLORS) do
-        self.colors[k] = v
-    end
-
-    self.cornerRadius = 5
-    self.font = nil
-
+    self.hover = 0     -- eased 0..1
+    self.pulse = false -- gentle glow to draw the eye
+    self.time = 0
     return self
 end
 
--- Set button text
 function Button:setText(text)
     self.text = text
 end
 
--- Set button position
 function Button:setPosition(x, y)
-    self.x = x
-    self.y = y
+    self.x, self.y = x, y
 end
 
--- Set button size
-function Button:setSize(width, height)
-    self.width = width
-    self.height = height
-end
-
--- Set custom colors
-function Button:setColor(colorType, r, g, b, a)
-    self.colors[colorType] = {r, g, b, a or 1}
-end
-
--- Set custom font
-function Button:setFont(font)
-    self.font = font
-end
-
--- Enable/disable button
 function Button:setEnabled(enabled)
     self.enabled = enabled
 end
 
--- Show/hide button
 function Button:setVisible(visible)
     self.visible = visible
+    if not visible then self.hovered, self.pressed = false, false end
 end
 
--- Check if point is inside button
 function Button:containsPoint(px, py)
     return px >= self.x and px <= self.x + self.width and
            py >= self.y and py <= self.y + self.height
 end
 
--- Handle mouse press
-function Button:mousepressed(x, y, button)
-    if not self.visible or not self.enabled then return false end
-    if button ~= 1 then return false end
+function Button:isActive()
+    return self.visible and self.enabled
+end
 
+function Button:mousepressed(x, y, button)
+    if not self:isActive() or button ~= 1 then return false end
     if self:containsPoint(x, y) then
         self.pressed = true
         return true
@@ -97,99 +59,85 @@ function Button:mousepressed(x, y, button)
     return false
 end
 
--- Handle mouse release
 function Button:mousereleased(x, y, button)
-    if not self.visible or not self.enabled then return false end
     if button ~= 1 then return false end
-
-    if self.pressed and self:containsPoint(x, y) then
-        self.pressed = false
-        if self.onClick then
-            self.onClick()
-        end
+    local wasPressed = self.pressed
+    self.pressed = false
+    if wasPressed and self:isActive() and self:containsPoint(x, y) then
+        if self.onClick then self.onClick() end
         return true
     end
-
-    self.pressed = false
     return false
 end
 
--- Handle mouse move
 function Button:mousemoved(x, y)
-    if not self.visible or not self.enabled then
-        self.hovered = false
-        return
-    end
-
-    self.hovered = self:containsPoint(x, y)
-
-    if not self.hovered then
-        self.pressed = false
-    end
+    self.hovered = self:isActive() and self:containsPoint(x, y)
 end
 
--- Update button state
 function Button:update(dt)
-    -- Could add animation here
+    self.time = self.time + dt
+    local target = self.hovered and 1 or 0
+    self.hover = self.hover + (target - self.hover) * math.min(1, dt * 14)
 end
 
--- Draw the button
 function Button:draw()
     if not self.visible then return end
+    local C = Theme.colors
+    local x, y, w, h = self.x, self.y, self.width, self.height
+    local a = self.enabled and 1 or 0.45
+    local lift = (self.pressed and 0 or self.hover * 1)
+    y = y - lift
 
-    -- Determine current color
-    local color
-    if not self.enabled then
-        color = {self.colors.normal[1] * 0.5, self.colors.normal[2] * 0.5,
-                 self.colors.normal[3] * 0.5, self.colors.normal[4] * 0.5}
-    elseif self.pressed then
-        color = self.colors.pressed
-    elseif self.hovered then
-        color = self.colors.hover
+    -- drop shadow
+    love.graphics.setColor(0, 0, 0, 0.35 * a)
+    love.graphics.rectangle("fill", x + 1, y + 2 + lift, w, h, 4)
+
+    if self.style == "gold" then
+        local glow = self.pulse and (0.5 + 0.5 * math.sin(self.time * 3)) or 0
+        if glow > 0 then
+            love.graphics.setColor(C.brassLight[1], C.brassLight[2], C.brassLight[3], 0.25 * glow)
+            love.graphics.rectangle("fill", x - 4, y - 4, w + 8, h + 8, 7)
+        end
+        Theme.setColor(self.pressed and C.brassDark or C.brass, a)
+        love.graphics.rectangle("fill", x, y, w, h, 4)
+        love.graphics.setColor(1, 1, 1, (0.12 + 0.18 * self.hover) * a)
+        love.graphics.rectangle("fill", x + 1, y + 1, w - 2, h / 2 - 1, 3)
+        Theme.setColor(C.brassLight, a)
+        love.graphics.setLineWidth(1)
+        love.graphics.rectangle("line", x + 0.5, y + 0.5, w - 1, h - 1, 4)
     else
-        color = self.colors.normal
+        local top = self.pressed and C.railBottom or C.railTop
+        Theme.setColor(top, a)
+        love.graphics.rectangle("fill", x, y, w, h, 4)
+        love.graphics.setColor(1, 0.9, 0.7, (0.05 + 0.08 * self.hover) * a)
+        love.graphics.rectangle("fill", x + 1, y + 1, w - 2, h / 2 - 1, 3)
+        local rim = C.brassDark
+        love.graphics.setColor(
+            rim[1] + (C.brass[1] - rim[1]) * self.hover,
+            rim[2] + (C.brass[2] - rim[2]) * self.hover,
+            rim[3] + (C.brass[3] - rim[3]) * self.hover, a)
+        love.graphics.setLineWidth(1)
+        love.graphics.rectangle("line", x + 0.5, y + 0.5, w - 1, h - 1, 4)
     end
 
-    -- Draw background
-    love.graphics.setColor(color)
-    love.graphics.rectangle("fill", self.x, self.y, self.width, self.height, self.cornerRadius)
-
-    -- Draw border
-    love.graphics.setColor(self.colors.border)
-    love.graphics.setLineWidth(2)
-    love.graphics.rectangle("line", self.x, self.y, self.width, self.height, self.cornerRadius)
-
-    -- Draw text
-    local oldFont = love.graphics.getFont()
-    if self.font then
-        love.graphics.setFont(self.font)
-    end
-
-    local font = love.graphics.getFont()
-    local textWidth = font:getWidth(self.text)
-    local textHeight = font:getHeight()
-
-    local textX = self.x + (self.width - textWidth) / 2
-    local textY = self.y + (self.height - textHeight) / 2
-
-    -- Text shadow
-    love.graphics.setColor(0, 0, 0, self.enabled and 0.5 or 0.25)
-    love.graphics.print(self.text, textX + 1, textY + 1)
-
-    -- Text
-    local textColor = self.colors.text
-    if not self.enabled then
-        love.graphics.setColor(textColor[1] * 0.5, textColor[2] * 0.5,
-                               textColor[3] * 0.5, textColor[4] * 0.5)
+    -- label
+    local font = Theme.font("button")
+    love.graphics.setFont(font)
+    local tx = math.floor(x + (w - font:getWidth(self.text)) / 2 + 0.5)
+    local ty = math.floor(y + (h - font:getHeight()) / 2 + 0.5)
+    if self.style == "gold" then
+        Theme.setColor(C.inkBlack, 0.9 * a)
+        love.graphics.print(self.text, tx, ty)
     else
-        love.graphics.setColor(textColor)
+        love.graphics.setColor(0, 0, 0, 0.5 * a)
+        love.graphics.print(self.text, tx, ty + 1)
+        local c = C.creamDim
+        love.graphics.setColor(
+            c[1] + (C.cream[1] - c[1]) * self.hover,
+            c[2] + (C.cream[2] - c[2]) * self.hover,
+            c[3] + (C.cream[3] - c[3]) * self.hover, a)
+        love.graphics.print(self.text, tx, ty)
     end
-    love.graphics.print(self.text, textX, textY)
-
-    if self.font then
-        love.graphics.setFont(oldFont)
-    end
-
     love.graphics.setColor(1, 1, 1)
 end
 

@@ -174,7 +174,7 @@ end
 
 -- True when the card is resting in this pile (not in flight or held)
 function Pile.isResting(card)
-    return not card.flying and not card.dragging
+    return not card.flying and not card.dragging and not card.hidden
 end
 
 -- Draw resting cards from index `first` to the top

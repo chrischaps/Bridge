@@ -76,7 +76,23 @@ Capture.scenarios = {
     gallery = {frames = 3, gallery = true, setup = function(ctx)
         ctx.game:deal(1, 1, false)
     end},
-    win = {frames = 150, setup = function(ctx)
+    stats = {frames = 40, setup = function(ctx)
+        ctx.game:deal(1, 1776, false)
+        ctx.showStats()
+    end},
+    winpanel = {frames = 60, setup = function(ctx)
+        local g = ctx.game
+        g:deal(1, 9, false)
+        Fixtures.place(g, Fixtures.solvedSpec())
+        settle(g)
+        g.scoring:begin()
+        g.scoring.elapsedTime = 254
+        g.scoring.score = 485
+        for _ = 1, 52 do g:autoStep() end
+        settle(g)
+        ctx.showWin()
+    end},
+    win = {frames = 400, setup = function(ctx)
         local g = ctx.game
         g:deal(1, 9, false)
         Fixtures.place(g, Fixtures.solvedSpec())
