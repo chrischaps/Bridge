@@ -2,6 +2,8 @@
 
 Klondike Solitaire for LÖVE 11.5, played on a burgundy baize card table. Bridge is the first game in a planned suite of card games. Everything is drawn in code (cards, suits, table, rail), and the only assets are two open-license typefaces.
 
+**Project page:** [chaps.dev/projects/bridge](https://chaps.dev/projects/bridge/), with screenshots of the table in play.
+
 ## Run
 
 ```
